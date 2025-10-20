@@ -2,10 +2,10 @@
 /**
  * Plugin Name:         DS - Créditos por Produtos para TeraWallet
  * Plugin URI:          https://dsantosinfo.com.br
- * Description:         Concede créditos na carteira TeraWallet e auto-completa pedidos virtuais que concedem créditos. Compatível com HPOS.
- * Version:             2.0.0
+ * Description:         Concede créditos na carteira TeraWallet, auto-completa pedidos e envia notificações via WhatsApp. Compatível com HPOS.
+ * Version:             4.0.0
  * Author:              DSantos Info
- * Author URI:          https://backgamon.dsantosinfo.com.br
+ * Author URI:          https://dsantosinfo.com.br
  * License:             GPLv2 or later
  * License URI:         https://www.gnu.org/licenses/gpl-2.0.html
  * Text Domain:         dsi-wc-credits
@@ -13,6 +13,7 @@
  * WC requires at least: 5.0
  * WC tested up to:      8.2
  */
+
 // Se o arquivo for acessado diretamente, aborte.
 if (!defined('ABSPATH')) {
     exit;
@@ -37,14 +38,11 @@ final class DSI_WC_Credits_For_Products_Manager {
     }
 
     private function __construct() {
-        // Ações executadas apenas no painel de administração
         if (is_admin()) {
             add_action('plugins_loaded', [$this, 'check_dependencies']);
             add_action('woocommerce_product_options_general_product_data', [$this, 'add_credits_custom_field']);
             add_action('woocommerce_process_product_meta', [$this, 'save_credits_custom_field']);
         }
-
-        // Ações executadas no frontend e em processos de fundo (webhooks, etc)
         add_action('woocommerce_order_status_completed', [$this, 'award_credits_on_order_completion'], 10, 1);
         add_action('woocommerce_payment_complete', [$this, 'auto_complete_eligible_virtual_orders'], 20, 1);
     }
@@ -134,20 +132,79 @@ final class DSI_WC_Credits_For_Products_Manager {
             }
         }
 
-        if ($total_credits_to_add > 0) {
-            if (function_exists('woo_wallet')) {
-                $note = sprintf(__('Créditos recebidos pela compra de produtos no pedido #%s', 'dsi-wc-credits'), $order->get_order_number());
-                
-                woo_wallet()->wallet->credit($user_id, $total_credits_to_add, $note);
-                
-                $order->add_order_note(
-                    sprintf(__('%s créditos foram adicionados à carteira do cliente.', 'dsi-wc-credits'), $total_credits_to_add)
-                );
+        if ($total_credits_to_add > 0 && function_exists('woo_wallet')) {
+            $note = sprintf(__('Créditos recebidos pela compra de produtos no pedido #%s', 'dsi-wc-credits'), $order->get_order_number());
+            
+            // Adiciona os créditos à carteira
+            woo_wallet()->wallet->credit($user_id, $total_credits_to_add, $note);
+            
+            // --- INÍCIO DA LÓGICA DE NOTIFICAÇÃO VIA WHATSAPP ---
+            $this->send_credits_notification($user_id, $total_credits_to_add, $order->get_order_number());
+            // --- FIM DA LÓGICA DE NOTIFICAÇÃO ---
 
-                $order->update_meta_data('_dsi_credits_awarded', 'yes');
-                $order->save();
+            $order->add_order_note(
+                sprintf(__('%s créditos foram adicionados à carteira do cliente.', 'dsi-wc-credits'), $total_credits_to_add)
+            );
+
+            $order->update_meta_data('_dsi_credits_awarded', 'yes');
+            $order->save();
+        }
+    }
+
+    /**
+     * NOVA FUNÇÃO: Envia a notificação via WhatsApp se a classe do outro plugin existir.
+     */
+    private function send_credits_notification($user_id, $credits_added, $order_number) {
+        // A notificação só funciona se o plugin backgammon-challonge estiver ativo
+        if (!class_exists('\BG_Challonge\Whatsapp')) {
+            return;
+        }
+
+        $phone = $this->get_user_phone($user_id);
+        $user_data = get_userdata($user_id);
+
+        if (!$phone || !$user_data) {
+            return;
+        }
+
+        // Obtém o novo saldo total da carteira para incluir na mensagem
+        $new_total_balance = woo_wallet()->wallet->get_wallet_balance($user_id, 'numeric');
+
+        $message = sprintf(
+            "Olá %s! Você ganhou *%s créditos* pela sua compra no pedido #%s.\nSeu novo saldo é de *%s créditos*.",
+            $user_data->first_name ?: $user_data->display_name,
+            wc_format_decimal($credits_added, 2),
+            $order_number,
+            wc_format_decimal($new_total_balance, 2)
+        );
+
+        try {
+            $whatsapp_sender = new \BG_Challonge\Whatsapp();
+            $whatsapp_sender->send_message($phone, $message);
+        } catch (\Exception $e) {
+            // Loga um erro silenciosamente caso algo dê errado no envio, sem quebrar o site.
+            error_log('DSI Credits Plugin: Falha ao enviar notificação via WhatsApp. Erro: ' . $e->getMessage());
+        }
+    }
+
+    /**
+     * NOVA FUNÇÃO: Helper para obter o número de telefone de um usuário.
+     */
+    private function get_user_phone($user_id) {
+        // Busca o campo ACF 'user_whatsapp' primeiro (como no plugin de torneios)
+        if (function_exists('get_field')) {
+            $phone = get_field('user_whatsapp', 'user_' . $user_id);
+            if (!empty($phone)) {
+                return preg_replace('/\D/', '', $phone);
             }
         }
+        
+        // Fallback para campos meta padrão do WordPress/WooCommerce
+        $phone = get_user_meta($user_id, 'whatsapp_number', true);
+        if (empty($phone)) {
+            $phone = get_user_meta($user_id, 'billing_phone', true);
+        }
+        return $phone ? preg_replace('/\D/', '', $phone) : null;
     }
 }
 
